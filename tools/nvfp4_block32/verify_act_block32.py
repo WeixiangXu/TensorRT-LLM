@@ -16,11 +16,30 @@ Checks, on random data:
 
 Usage: python verify_act_block32.py
 """
+import os
 import sys
 
 import torch
 
-import tensorrt_llm  # noqa: F401  (registers torch.ops.trtllm)
+
+def load_trtllm_ops():
+    """Register torch.ops.trtllm without importing the full package.
+
+    Importing tensorrt_llm pulls in mpi4py and the rest of the runtime, none of
+    which this check needs -- it only calls one quantization op. Loading the
+    torch bindings directly keeps the check runnable on a bare container.
+    """
+    try:
+        import tensorrt_llm  # noqa: F401
+        return "package"
+    except ImportError:
+        pass
+    for root in sys.path:
+        lib = os.path.join(root, "tensorrt_llm", "libs", "libth_common.so")
+        if os.path.exists(lib):
+            torch.ops.load_library(lib)
+            return lib
+    raise RuntimeError("libth_common.so not found on sys.path")
 
 E2M1_MAX = 6.0
 LINEAR_LAYOUT = False
@@ -57,6 +76,9 @@ def main():
     if not torch.cuda.is_available():
         print("FAIL: no CUDA device")
         return 1
+    print("trtllm ops from: %s" % load_trtllm_ops())
+    print("device: %s (sm_%d%d)" % ((torch.cuda.get_device_name(0),) +
+                                    torch.cuda.get_device_capability()))
     torch.manual_seed(0)
     m, k = 256, 1024
     x = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
