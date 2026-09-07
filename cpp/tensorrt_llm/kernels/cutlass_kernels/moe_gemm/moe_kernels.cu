@@ -3036,7 +3036,8 @@ void doActivationDynamic(T* output, GemmOutputType const* gemm_result, float con
             fn<<<dim3(grid_x, grid_y, 1), dim3(1, ACTIVATION_THREADS_PER_BLOCK, 1), 0, stream>>>(output, gemm_result,
                 fp8_quant, bias, bias_is_broadcast, expert_first_token_offset, num_experts_per_node, inter_size,
                 quant_params.fp4.fc2.act_global_scale, use_per_expert_act_scale, fc2_act_sf_flat, activation_type,
-                (GemmOutputType const*) nullptr, dynamic_amax, bf16_intermediate, Fp8BlockScaleActOutput{});
+                (GemmOutputType const*) nullptr, dynamic_amax, bf16_intermediate, Fp8BlockScaleActOutput{},
+                tensorrt_llm::common::getEnvNvfp4ActBlock32());
             sync_check_cuda_error(stream);
         }
 
