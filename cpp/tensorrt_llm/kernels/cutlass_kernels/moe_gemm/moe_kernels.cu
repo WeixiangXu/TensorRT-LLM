@@ -2812,9 +2812,11 @@ void doActivation(T* output, GemmOutputType const* gemm_result, float const* fp8
         {
             // IMPORTANT: Keep the order of the activation functions in the same order as the ActivationType enum in
             // common.h
+            // NB: the trailing bool is act_block32. A default argument does not
+            // change a function's type, so it has to be spelled out here too.
             using KernelFnPtr = void (*)(T*, GemmOutputType const*, float const*, ScaleBiasType const*, bool,
                 int64_t const*, int, int64_t, float const*, bool, TmaWarpSpecializedGroupedGemmInput::ElementSF*,
-                ActivationParams, GemmOutputType const*, float*, GemmOutputType*, Fp8BlockScaleActOutput);
+                ActivationParams, GemmOutputType const*, float*, GemmOutputType*, Fp8BlockScaleActOutput, bool);
 
             // write_fp8_block_scale toggles the fused pre-FC2 1x128 activation quant in the epilogue; it is
             // orthogonal to the activation function, so every activation below can be fused (write_fp8_block_scale
