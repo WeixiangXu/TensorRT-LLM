@@ -1000,11 +1000,16 @@ __host__ __device__ constexpr int64_t getOffsetActivationSF(int64_t expert_id, i
     return 0;
 }
 
+// act_block32 is a numerics-study switch for NVFP4: the scale is computed over
+// 2 * VecSize elements and written into both of the VecSize slots those elements
+// span, so the activations carry block32 numerics while the scale-factor tensor
+// keeps its block16 shape and the GEMMs are untouched. It saves no scale storage
+// and therefore says nothing about a real block32 kernel's performance.
 template <class GemmOutputType, class QuantizedType, class ComputeElem, int VecSize>
 __device__ auto quantizePackedFPXValue(ComputeElem& post_act_val, float global_scale_val,
     int64_t num_tokens_before_expert, int64_t expert_id, int64_t token_id, int64_t elem_idx, int64_t num_cols,
     TmaWarpSpecializedGroupedGemmInput::ElementSF* act_sf_flat,
-    TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType scaling_type)
+    TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType scaling_type, bool act_block32 = false)
 {
     constexpr bool is_fp8 = std::is_same_v<QuantizedType, __nv_fp8_e4m3>;
     static constexpr int NumThreadsPerSF = VecSize / CVT_ELTS_PER_THREAD;
@@ -1026,6 +1031,27 @@ __device__ auto quantizePackedFPXValue(ComputeElem& post_act_val, float global_s
     auto sf_out = cvt_quant_get_sf_out_offset<TmaWarpSpecializedGroupedGemmInput::ElementSF, NumThreadsPerSF>(
         std::nullopt /* batchIdx */, token_id - num_tokens_before_expert, elem_idx, std::nullopt /* numRows */,
         num_cols / VecSize, act_sf_expert, QuantizationSFLayout::SWIZZLED);
+
+    if constexpr (!is_fp8)
+    {
+        // MXFPX already spans 32 elements, so only NVFP4 has anything to widen.
+        // A partial trailing group would straddle the replicated slot pair, so
+        // the launchers reject sizes that are not a multiple of 2 * VecSize.
+        if (act_block32 && scaling_type == TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::NVFP4
+            && num_cols % (2 * VecSize) == 0)
+        {
+            static constexpr int QuantVecSize = 2 * VecSize;
+            static constexpr int NumThreadsPerQuantSF = QuantVecSize / CVT_ELTS_PER_THREAD;
+            // The slot count stays on the VecSize grid; only the span of elements
+            // sharing one computed scale grows, and that scale lands in both slots.
+            auto sf_out_block32
+                = cvt_quant_get_sf_out_offset<TmaWarpSpecializedGroupedGemmInput::ElementSF, NumThreadsPerQuantSF, 2>(
+                    std::nullopt /* batchIdx */, token_id - num_tokens_before_expert, elem_idx,
+                    std::nullopt /* numRows */, num_cols / VecSize, act_sf_expert, QuantizationSFLayout::SWIZZLED);
+            return cvt_warp_fp16_to_fp4<GemmOutputType, QuantVecSize, false, 2>(
+                packed_vec, global_scale_val, sf_out_block32);
+        }
+    }
 
     // Do the conversion and set the output and scaling factor
     auto func = [&]()
@@ -1396,7 +1422,8 @@ __global__ void expandInputRowsKernel(InputActivationsType const* unpermuted_inp
     float const* fc1_act_global_scale, bool use_per_expert_act_scale, int64_t const* expert_first_token_offset,
     TmaWarpSpecializedGroupedGemmInput::ElementSF* fc1_act_sf_flat,
     TmaWarpSpecializedGroupedGemmInput::ElementSF const* input_sf, bool const swizzled_input_sf,
-    int64_t const num_experts_per_node, InputActivationsType const* prequant_scales = nullptr)
+    int64_t const num_experts_per_node, InputActivationsType const* prequant_scales = nullptr,
+    bool act_block32 = false)
 {
     static_assert(BlockScalingType == TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::NONE || !PRE_QUANT_AWQ,
         "AWQ and Block Scaling are mutually exclusive");
@@ -1489,7 +1516,8 @@ __global__ void expandInputRowsKernel(InputActivationsType const* unpermuted_inp
                         in_vec, global_scale_val, num_tokens_before_expert, expert, permuted_row, elem_index,
                         padded_hidden_size, fc1_act_sf_flat,
                         is_nvfp4 ? TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::NVFP4
-                                 : TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::MXFPX);
+                                 : TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::MXFPX,
+                        act_block32);
                     static_assert(
                         sizeof(res) == sizeof(*dest_row_ptr), "Quantized value must be the same size as the output");
                     dest_row_ptr[elem_index] = res;
@@ -1681,10 +1709,19 @@ void expandInputRowsKernelLauncher(InputActivationsType const* unpermuted_input,
     attrs[0].val.programmaticStreamSerializationAllowed = tensorrt_llm::common::getEnvEnablePDL();
     config.numAttrs = 1;
     config.attrs = attrs;
+    // The kernel groups over the SF-aligned width, so check the same quantity it
+    // sees rather than the unpadded hidden size.
+    TLLM_CHECK_WITH_INFO(!tensorrt_llm::common::getEnvNvfp4ActBlock32()
+            || TmaWarpSpecializedGroupedGemmInput::alignToSfDim(
+                   hidden_size, TmaWarpSpecializedGroupedGemmInput::MinKDimAlignmentNVFP4)
+                    % (2 * TmaWarpSpecializedGroupedGemmInput::NVFP4BlockScaleVectorSize)
+                == 0,
+        "TRTLLM_NVFP4_ACT_BLOCK32 requires an SF-aligned hidden size divisible by 32");
     cudaLaunchKernelEx(&config, func, unpermuted_input, permuted_output, unpermuted_scales, permuted_scales,
         permuted_row_to_unpermuted_row, num_rows, hidden_size, k, quant_params.fp4.fc1.act_global_scale,
         use_per_expert_act_scale, expert_first_token_offset, fc1_act_sf_flat, input_sf, swizzled_input_sf,
-        num_experts_per_node, reinterpret_cast<InputActivationsType const*>(prequant_scales));
+        num_experts_per_node, reinterpret_cast<InputActivationsType const*>(prequant_scales),
+        tensorrt_llm::common::getEnvNvfp4ActBlock32());
 }
 
 struct Fp8BlockScaleActOutput
@@ -2303,7 +2340,8 @@ __global__ __launch_bounds__(ACTIVATION_THREADS_PER_BLOCK) void doActivationKern
     float const* fc2_act_global_scale, bool use_per_expert_act_scale,
     TmaWarpSpecializedGroupedGemmInput::ElementSF* fc2_act_sf_flat, ActivationParams activation_params,
     GemmOutputType const* prequant_scale, float* dynamic_fc2_amax = nullptr,
-    GemmOutputType* bf16_intermediate_output = nullptr, Fp8BlockScaleActOutput fp8_block_scale_out = {})
+    GemmOutputType* bf16_intermediate_output = nullptr, Fp8BlockScaleActOutput fp8_block_scale_out = {},
+    bool act_block32 = false)
 {
 #ifdef ENABLE_FP4
     constexpr bool IsNVFP4 = std::is_same_v<T, __nv_fp4_e2m1>
@@ -2504,7 +2542,8 @@ __global__ __launch_bounds__(ACTIVATION_THREADS_PER_BLOCK) void doActivationKern
                 auto res = quantizePackedFPXValue<GemmOutputType, T, ComputeElem, VecSize>(post_act_val,
                     global_scale_val, num_tokens_before_expert, expert, token, elem_index, inter_size, fc2_act_sf_flat,
                     IsNVFP4 ? TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::NVFP4
-                            : TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::MXFPX);
+                            : TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::MXFPX,
+                    act_block32);
                 static_assert(
                     sizeof(res) == sizeof(*output_vec), "Quantized value must be the same size as the output");
                 output_vec[elem_index] = res;
@@ -2627,7 +2666,8 @@ __global__ __launch_bounds__(ACTIVATION_THREADS_PER_BLOCK) void dynamicFP4Quanti
     float const* dynamic_amax,                // [1] global amax from doActivation
     float const* fc2_weight_scale_2,          // [num_experts] per-expert weight_scale_2
     TmaWarpSpecializedGroupedGemmInput::ElementSF* fc2_act_sf_flat, // block scale output
-    float* dynamic_fc2_alpha)                                       // [num_experts] output: adjusted alpha
+    float* dynamic_fc2_alpha,                                       // [num_experts] output: adjusted alpha
+    bool act_block32 = false)
 {
 #ifdef ENABLE_FP4
     constexpr bool IsNVFP4 = std::is_same_v<T, __nv_fp4_e2m1>
@@ -2699,7 +2739,7 @@ __global__ __launch_bounds__(ACTIVATION_THREADS_PER_BLOCK) void dynamicFP4Quanti
         // Use dyn_input_scale (= 448*6/amax) as the global scale for FP4 quantization
         auto res = quantizePackedFPXValue<GemmOutputType, T, ComputeElem, VecSize>(float_val, dyn_input_scale,
             num_tokens_before_expert, expert, token, col_offset, inter_size, fc2_act_sf_flat,
-            TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::NVFP4);
+            TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::NVFP4, act_block32);
         static_assert(sizeof(res) == sizeof(*output_vec));
         output_vec[col_offset] = res;
 
@@ -2888,10 +2928,13 @@ void doActivation(T* output, GemmOutputType const* gemm_result, float const* fp8
         attrs[0].val.programmaticStreamSerializationAllowed = tensorrt_llm::common::getEnvEnablePDL();
         config.numAttrs = 1;
         config.attrs = attrs;
+        TLLM_CHECK_WITH_INFO(!tensorrt_llm::common::getEnvNvfp4ActBlock32()
+                || inter_size % (2 * TmaWarpSpecializedGroupedGemmInput::NVFP4BlockScaleVectorSize) == 0,
+            "TRTLLM_NVFP4_ACT_BLOCK32 requires an intermediate size divisible by 32");
         cudaLaunchKernelEx(&config, fn, output, gemm_result, fp8_quant, bias, bias_is_broadcast,
             expert_first_token_offset, num_experts_per_node, inter_size, quant_params.fp4.fc2.act_global_scale,
             use_per_expert_act_scale, fc2_act_sf_flat, activation_type, prequant_scale, (float*) nullptr,
-            (GemmOutputType*) nullptr, fp8_block_scale_out);
+            (GemmOutputType*) nullptr, fp8_block_scale_out, tensorrt_llm::common::getEnvNvfp4ActBlock32());
     }; // end lambda doActivationKernelLauncher
 
     // 256 threads per block * 256 blocks / 1 rows per block can be handled by 1-2 waves depending on SM arch
@@ -3007,7 +3050,8 @@ void doActivationDynamic(T* output, GemmOutputType const* gemm_result, float con
 
             fn<<<dim3(grid_x, grid_y, 1), dim3(1, ACTIVATION_THREADS_PER_BLOCK, 1), 0, stream>>>(output,
                 bf16_intermediate, expert_first_token_offset, num_experts_per_node, inter_size, dynamic_amax,
-                quant_params.fp4.dynamic_fc2_input_scale.weight_scale_2, fc2_act_sf_flat, dynamic_fc2_alpha);
+                quant_params.fp4.dynamic_fc2_input_scale.weight_scale_2, fc2_act_sf_flat, dynamic_fc2_alpha,
+                tensorrt_llm::common::getEnvNvfp4ActBlock32());
             sync_check_cuda_error(stream);
         }
     }

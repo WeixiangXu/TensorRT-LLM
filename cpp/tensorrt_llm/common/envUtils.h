@@ -55,6 +55,10 @@ int getEnvMmhaKernelBlockSize();
 // Whether PDL is enabled.
 bool getEnvEnablePDL();
 
+// Quantize NVFP4 activations over 32 elements, replicating the scale into both
+// block16 slots. Accuracy experiment only; see envUtils.cpp.
+bool getEnvNvfp4ActBlock32();
+
 // Whether the experimental cascade attention kernel is enabled (replaces
 // masked_multihead_attention_kernel for beam-search decoding).
 // Controlled by env var TRTLLM_ENABLE_CASCADE_MMHA (default: false).

@@ -260,6 +260,16 @@ bool getEnvEnablePDL()
     return enablePDL;
 }
 
+// Numerics study: quantize NVFP4 activations over 32 elements and replicate the
+// scale into both of the block16 slots those elements span, giving block32
+// numerics on tensor cores that only read a scale every 16 elements. Accuracy
+// only -- scale storage is unchanged, so it saves no metadata traffic.
+bool getEnvNvfp4ActBlock32()
+{
+    static bool const enable = getBoolEnv("TRTLLM_NVFP4_ACT_BLOCK32");
+    return enable;
+}
+
 bool getEnvEnableCascadeMmha()
 {
     static bool const enable = getBoolEnv("TRTLLM_ENABLE_CASCADE_MMHA");
