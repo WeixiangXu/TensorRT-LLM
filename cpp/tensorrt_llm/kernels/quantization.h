@@ -73,7 +73,11 @@ void invokePerTokenQuantization(QuantT* dst, T const* src, int64_t const numRows
     float const* clampPtr, float* scalePtr, float* sumPtr, tensorrt_llm::common::QuantMode quantMode,
     cudaStream_t stream = 0);
 
-template <typename T, int SF_VEC_SIZE = 16>
+// SF_OUTPUT_VEC_SIZE defaults to the quantization vector size. Setting it to 16
+// while SF_VEC_SIZE is 32 writes each block32 scale into both of the block16
+// slots its elements span, which is how block32 numerics are measured on tensor
+// cores that only read a scale every 16 elements.
+template <typename T, int SF_VEC_SIZE = 16, int SF_OUTPUT_VEC_SIZE = SF_VEC_SIZE>
 void invokeFP4Quantization(int b, int m, int n, T const* input, float const* globalScale, int64_t* output,
     int32_t* SFOuput, bool useUE8M0, QuantizationSFLayout layout, int multiProcessorCount, cudaStream_t stream = 0);
 

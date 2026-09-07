@@ -452,8 +452,12 @@ struct PackedVec<__nv_fp8_e4m3>
         "Vector size should match the number of elements per thread.");
 };
 
+// Defined below; declared here because the FP4 converters store through it.
+template <int SF_REPLICATION>
+inline __device__ void cvt_store_replicated_sf(uint8_t* SFout, uint8_t sfValue);
+
 // Quantizes the provided PackedVec into the uint32_t output
-template <class Type, int SF_VEC_SIZE, bool UE8M0_SF>
+template <class Type, int SF_VEC_SIZE, bool UE8M0_SF, int SF_REPLICATION = 1>
 __device__ uint32_t cvt_warp_fp16_to_fp4(PackedVec<Type>& vec, float SFScaleVal, uint8_t* SFout)
 {
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
@@ -506,11 +510,10 @@ __device__ uint32_t cvt_warp_fp16_to_fp4(PackedVec<Type>& vec, float SFScaleVal,
         outputScale = vecMax != 0 ? reciprocal_approximate_ftz(SFValue * reciprocal_approximate_ftz(SFScaleVal)) : 0.0f;
     }
 
-    if (SFout)
-    {
-        // Write the SF to global memory (STG.8).
-        *SFout = fp8SFVal;
-    }
+    // Store one byte per consumer scale slot. For example, a K32 quantization
+    // scale is replicated into two K16 slots for an NVFP4 consumer, which gives
+    // block32 numerics on tensor cores that only read a scale every 16 elements.
+    cvt_store_replicated_sf<SF_REPLICATION>(SFout, fp8SFVal);
 
     // Convert the input to float.
     float2 fp2Vals[CVT_ELTS_PER_THREAD / 2];
@@ -540,7 +543,7 @@ __device__ uint32_t cvt_warp_fp16_to_fp4(PackedVec<Type>& vec, float SFScaleVal,
 #endif
 }
 
-template <class Type, int SF_VEC_SIZE, bool UE8M0_SF>
+template <class Type, int SF_VEC_SIZE, bool UE8M0_SF, int SF_REPLICATION = 1>
 __device__ uint64_t cvt_warp_fp8_to_fp4(PackedVec<Type>& vec, float SFScaleVal, uint8_t* SFout)
 {
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
@@ -603,11 +606,8 @@ __device__ uint64_t cvt_warp_fp8_to_fp4(PackedVec<Type>& vec, float SFScaleVal, 
     // Recipe: final_scale = reciprocal(fp32(fp8(SFValue * SFScaleVal))) * reciprocal(SFScaleVal))
     float outputScale = SFValue != 0 ? SFScaleVal * reciprocal_approximate_ftz(SFValueNarrow) : 0.0f;
 
-    if (SFout)
-    {
-        // Write the SF to global memory (STG.8).
-        *SFout = fp8SFVal;
-    }
+    // Store one byte per consumer scale slot (see cvt_warp_fp16_to_fp4).
+    cvt_store_replicated_sf<SF_REPLICATION>(SFout, fp8SFVal);
 
     // Convert the input to float.
     float2 fp2Vals[CVT_FP8_TO_FP4_ELTS_PER_THREAD / 2];
@@ -943,12 +943,14 @@ quantize_with_block_size(
                         if constexpr (quantization_type == BlockScaleQuantizationType::FP16_TO_FP4)
                         {
                             reinterpret_cast<uint32_t*>(out)[outOffset]
-                                = cvt_warp_fp16_to_fp4<Type, SF_VEC_SIZE, UE8M0_SF>(in_vec, SFScaleVal, sf_out);
+                                = cvt_warp_fp16_to_fp4<Type, SF_VEC_SIZE, UE8M0_SF, SF_REPLICATION>(
+                                    in_vec, SFScaleVal, sf_out);
                         }
                         else if constexpr (quantization_type == BlockScaleQuantizationType::FP8_TO_FP4)
                         {
                             reinterpret_cast<uint64_t*>(out)[outOffset]
-                                = cvt_warp_fp8_to_fp4<__nv_fp8_e4m3, SF_VEC_SIZE, UE8M0_SF>(in_vec, SFScaleVal, sf_out);
+                                = cvt_warp_fp8_to_fp4<__nv_fp8_e4m3, SF_VEC_SIZE, UE8M0_SF, SF_REPLICATION>(
+                                    in_vec, SFScaleVal, sf_out);
                         }
                         else if constexpr (quantization_type == BlockScaleQuantizationType::FP16_TO_MXFP8)
                         {

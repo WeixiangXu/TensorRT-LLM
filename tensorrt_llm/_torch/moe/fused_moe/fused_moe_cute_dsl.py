@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import math
+import os
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
@@ -794,6 +795,15 @@ class CuteDslFusedMoE(MoEImplBase):
         self.use_fused_finalize = (not model_config.moe_disable_finalize_fusion
                                    and model_config.lora_config is None)
 
+        # Numerics study only: quantize the FC1 input over 32 elements and
+        # replicate that scale across both block16 slots those elements span,
+        # giving block32 activation numerics on block16-only tensor cores. The
+        # scale tensor keeps its block16 shape, so nothing downstream changes,
+        # and no scale-storage traffic is saved -- this measures accuracy, not
+        # the performance a real block32 kernel would deliver.
+        self.nvfp4_act_block32 = os.environ.get(
+            "TRTLLM_NVFP4_ACT_BLOCK32", "0") == "1"
+
         # Output-memset overlap is independent of MoE chunking, so ensure its
         # stream and events exist even if the parent creates no chunking event.
         if self.aux_stream_dict is None:
@@ -910,7 +920,7 @@ class CuteDslFusedMoE(MoEImplBase):
                 x_row = x.shape[0]
                 x, x_sf = torch.ops.trtllm.fp4_quantize(
                     x, self.fc31_input_scale, self.scaling_vector_size, False,
-                    False)
+                    False, 32 if self.nvfp4_act_block32 else 0)
         elif self.has_deepseek_fp8_block_scales:
             # FP8 block scales doesn't support permutation of quantized inputs.
             # WAR: The quantization is in run_moe_fp8_block_scales.

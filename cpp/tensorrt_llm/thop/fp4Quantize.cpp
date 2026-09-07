@@ -35,6 +35,11 @@ namespace torch_ext
 // globalScale: [1] float, = (448 * 6) / self.abs().max(). Not used when sfUseUE8M0 is true.
 // nvfp4: sfVecSize = 16, sfUseUE8M0 = false
 // mxfp4: sfVecSize = 32, sfUseUE8M0 = true
+// sfQuantVecSize: elements sharing one computed scale. 0 means "same as
+// sfVecSize" (the normal case). Setting it to 32 while sfVecSize is 16 measures
+// block32 numerics on block16-only tensor cores: the scale is computed over 32
+// elements and written into both of the block16 slots those elements span, so
+// the scale-factor tensor keeps its block16 shape and consumers are unchanged.
 // alignment: sfVecSize
 // sfUseUE8M0: bool, if true, scale factors use UE8M0 format (MXFP4); otherwise UE4M3 (NVFP4).
 // isSfSwizzledLayout: bool, if true, the scale factors are stored in swizzled layout, otherwise in linear layout.
@@ -43,10 +48,20 @@ namespace torch_ext
 // self_fp4: [M, K / 2], FLOAT4_E2M1X2
 // self_block_scale_factors: ceil(M / 128) * 128 * ceil(K / sfVecSize / 4) * 4, SF_DTYPE (UE4M3 or UE8M0)
 std::tuple<at::Tensor, at::Tensor> fp4_quantize(at::Tensor const& self, std::optional<at::Tensor> const& globalScale,
-    int64_t sfVecSize, bool sfUseUE8M0, bool isSfSwizzledLayout)
+    int64_t sfVecSize, bool sfUseUE8M0, bool isSfSwizzledLayout, int64_t sfQuantVecSize)
 {
     CHECK_TH_CUDA(self);
     CHECK_CONTIGUOUS(self);
+    if (sfQuantVecSize == 0)
+    {
+        sfQuantVecSize = sfVecSize;
+    }
+    bool const isBlock32Fake = sfQuantVecSize != sfVecSize;
+    if (isBlock32Fake)
+    {
+        TORCH_CHECK(sfQuantVecSize == 32 && sfVecSize == 16 && !sfUseUE8M0,
+            "sfQuantVecSize may only differ from sfVecSize for the UE4M3 32-over-16 case");
+    }
     if (sfUseUE8M0)
     {
         TORCH_CHECK(sfVecSize == 32, "sfVecSize can only be 32, when sfUseUE8M0 is true");
@@ -75,6 +90,7 @@ std::tuple<at::Tensor, at::Tensor> fp4_quantize(at::Tensor const& self, std::opt
     }
     auto const k = inputShape[rank - 1];
     TORCH_CHECK(k % sfVecSize == 0);
+    TORCH_CHECK(k % sfQuantVecSize == 0);
 
     std::vector<int64_t> outputShape(inputShape.begin(), inputShape.end());
     outputShape[rank - 1] = k / 2;
@@ -92,13 +108,43 @@ std::tuple<at::Tensor, at::Tensor> fp4_quantize(at::Tensor const& self, std::opt
     auto const layout = isSfSwizzledLayout ? tensorrt_llm::QuantizationSFLayout::SWIZZLED
                                            : tensorrt_llm::QuantizationSFLayout::LINEAR;
 
-#define LAUNCH_FP4_QUANTIZE_KERNEL(T, SF_VEC_SIZE)                                                                     \
-    tensorrt_llm::kernels::invokeFP4Quantization<T, SF_VEC_SIZE>(1, m, k, reinterpret_cast<T*>(self.data_ptr()),       \
+#define LAUNCH_FP4_QUANTIZE_KERNEL_EX(T, SF_QUANT_VEC_SIZE, SF_VEC_SIZE)                                               \
+    tensorrt_llm::kernels::invokeFP4Quantization<T, SF_QUANT_VEC_SIZE, SF_VEC_SIZE>(1, m, k,                            \
+        reinterpret_cast<T*>(self.data_ptr()),                                                                         \
         globalScalePtr, reinterpret_cast<int64_t*>(valueE2M1.data_ptr()),                                              \
         reinterpret_cast<int32_t*>(scaleFP8SF.data_ptr()), sfUseUE8M0, layout, mMultiProcessorCount,                   \
         at::cuda::getCurrentCUDAStream(self.get_device()));
 
-    if (sfUseUE8M0)
+#define LAUNCH_FP4_QUANTIZE_KERNEL(T, SF_VEC_SIZE) LAUNCH_FP4_QUANTIZE_KERNEL_EX(T, SF_VEC_SIZE, SF_VEC_SIZE)
+
+    if (isBlock32Fake)
+    {
+        if (self.scalar_type() == at::ScalarType::Half)
+        {
+            LAUNCH_FP4_QUANTIZE_KERNEL_EX(half, 32, 16)
+        }
+        else if (self.scalar_type() == at::ScalarType::BFloat16)
+        {
+#ifdef ENABLE_BF16
+            LAUNCH_FP4_QUANTIZE_KERNEL_EX(__nv_bfloat16, 32, 16)
+#else
+            C10_THROW_ERROR(NotImplementedError, "BFloat16 must be enabled to quantize an bf16 tensor to fp4.");
+#endif
+        }
+        else if (self.scalar_type() == at::ScalarType::Float8_e4m3fn)
+        {
+#ifdef ENABLE_FP8
+            LAUNCH_FP4_QUANTIZE_KERNEL_EX(__nv_fp8_e4m3, 32, 16)
+#else
+            C10_THROW_ERROR(NotImplementedError, "FP8 must be enabled to quantize an fp8 tensor to fp4.");
+#endif
+        }
+        else
+        {
+            C10_THROW_ERROR(NotImplementedError, "fp4_quantize only supports input tensor with dtypes fp16/bf16/e4m3.");
+        }
+    }
+    else if (sfUseUE8M0)
     {
         if (self.scalar_type() == at::ScalarType::Half)
         {
@@ -376,7 +422,7 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
     m.def(
         "fp4_quantize(Tensor input, Tensor? globalScale, int sfVecSize, bool sfUseUE8M0=False, bool "
-        "isSfSwizzledLayout=True) -> (Tensor, Tensor)");
+        "isSfSwizzledLayout=True, int sfQuantVecSize=0) -> (Tensor, Tensor)");
     m.def("calculate_nvfp4_global_scale(Tensor input, Tensor? tokensPerBatch) -> Tensor");
     m.def(
         "fp4_quantize_with_reorder_residual(Tensor X, Tensor input_scale, Tensor reorder_index, int KE, bool is_act) "

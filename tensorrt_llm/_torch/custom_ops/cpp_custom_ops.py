@@ -442,7 +442,10 @@ def _register_fake():
         sf_vec_size: int,
         sf_use_ue8m0=False,
         swizzled_layout=True,
+        sf_quant_vec_size=0,
     ):
+        # sf_quant_vec_size only changes which elements share a scale, not the
+        # shape of the scale tensor, which stays on the sf_vec_size grid.
         output_shape, scale_shape = fp4_utils.get_fp4_shape(
             input.shape, sf_vec_size, swizzled_layout)
 

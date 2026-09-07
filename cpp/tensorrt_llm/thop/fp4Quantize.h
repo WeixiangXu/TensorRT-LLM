@@ -29,7 +29,7 @@ TRTLLM_NAMESPACE_BEGIN
 namespace torch_ext
 {
 std::tuple<at::Tensor, at::Tensor> fp4_quantize(at::Tensor const& self, std::optional<at::Tensor> const& globalScale,
-    int64_t sfVecSize, bool sfUseUE8M0, bool isSfSwizzledLayout);
+    int64_t sfVecSize, bool sfUseUE8M0, bool isSfSwizzledLayout, int64_t sfQuantVecSize = 0);
 
 at::Tensor calculate_nvfp4_global_scale(at::Tensor const& input, std::optional<at::Tensor> const& tokensPerBatch);
 
