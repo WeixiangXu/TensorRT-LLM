@@ -15,7 +15,10 @@
  */
 
 #include "tensorrt_llm/thop/fp4Quantize.h"
+
+#include <mutex>
 #include "tensorrt_llm/common/cudaUtils.h"
+#include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/kernels/arcquantFP4.h"
 #include "tensorrt_llm/kernels/quantization.h"
 #include "tensorrt_llm/thop/thUtils.h"
@@ -119,6 +122,16 @@ std::tuple<at::Tensor, at::Tensor> fp4_quantize(at::Tensor const& self, std::opt
 
     if (isBlock32Fake)
     {
+        // Proof that the widened path was actually selected. The MoE FC1 input
+        // is quantized here, in Python, before any of the kernel-side code
+        // runs, so the device trace in moe_kernels.cu cannot see it.
+        static std::once_flag traceOnce;
+        std::call_once(traceOnce,
+            [&]()
+            {
+                TLLM_LOG_INFO("[nvfp4-block32] fp4_quantize widened: k=%ld sfVecSize=%ld sfQuantVecSize=%ld", (long) k,
+                    (long) sfVecSize, (long) sfQuantVecSize);
+            });
         if (self.scalar_type() == at::ScalarType::Half)
         {
             LAUNCH_FP4_QUANTIZE_KERNEL_EX(half, 32, 16)

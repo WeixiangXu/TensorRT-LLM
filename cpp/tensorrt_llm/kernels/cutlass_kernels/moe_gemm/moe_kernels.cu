@@ -3057,6 +3057,13 @@ void doActivationDynamic(T* output, GemmOutputType const* gemm_result, float con
         // Phase 2: FP4 quantize with dynamic global scale
         {
             constexpr auto NVFP4_TYPE = TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::NVFP4;
+            // Same fail-fast as the static path. Without it the device-side
+            // guard would quietly fall back to block16 for a size that is not a
+            // multiple of 32, so a run with the flag set would silently mix the
+            // two granularities and report a block16 result as block32.
+            TLLM_CHECK_WITH_INFO(!tensorrt_llm::common::getEnvNvfp4ActBlock32()
+                    || inter_size % (2 * TmaWarpSpecializedGroupedGemmInput::NVFP4BlockScaleVectorSize) == 0,
+                "TRTLLM_NVFP4_ACT_BLOCK32 requires an intermediate size divisible by 32");
             auto fn = &dynamicFP4QuantizeKernel<T, GemmOutputType, NVFP4_TYPE>;
 
             static int32_t const sm_count = tensorrt_llm::common::getMultiProcessorCount();
