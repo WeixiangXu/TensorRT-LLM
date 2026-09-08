@@ -1000,6 +1000,10 @@ __host__ __device__ constexpr int64_t getOffsetActivationSF(int64_t expert_id, i
     return 0;
 }
 
+// Guards the one-line trace below. CUDA does not allow a static __device__
+// variable inside a device function, so it lives here.
+__device__ int gNvfp4Block32Traced = 0;
+
 // act_block32 is a numerics-study switch for NVFP4: the scale is computed over
 // 2 * VecSize elements and written into both of the VecSize slots those elements
 // span, so the activations carry block32 numerics while the scale-factor tensor
@@ -1040,6 +1044,15 @@ __device__ auto quantizePackedFPXValue(ComputeElem& post_act_val, float global_s
         if (act_block32 && scaling_type == TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::NVFP4
             && num_cols % (2 * VecSize) == 0)
         {
+            // Run-to-run noise in MoE routing swamps any attempt to prove this
+            // branch runs by comparing model outputs, so say so directly. The
+            // branch is already opt-in through TRTLLM_NVFP4_ACT_BLOCK32, and
+            // the flag keeps this to one line per process rather than per
+            // launch, so it costs nothing when the study is not running.
+            if (atomicCAS(&gNvfp4Block32Traced, 0, 1) == 0)
+            {
+                printf("[nvfp4-block32] branch taken: num_cols=%ld VecSize=%d\n", (long) num_cols, VecSize);
+            }
             static constexpr int QuantVecSize = 2 * VecSize;
             static constexpr int NumThreadsPerQuantSF = QuantVecSize / CVT_ELTS_PER_THREAD;
             // The slot count stays on the VecSize grid; only the span of elements

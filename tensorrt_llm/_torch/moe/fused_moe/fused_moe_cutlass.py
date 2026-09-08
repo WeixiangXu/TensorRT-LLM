@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 from typing import Dict, List, Optional, Tuple, Union
 
 import torch
@@ -379,6 +380,14 @@ class CutlassFusedMoE(MoEImplBase):
 
         # Finalize fusion should be disabled if Lora is used.
         self.use_fused_finalize = not model_config.moe_disable_finalize_fusion and model_config.lora_config is None
+
+        # Numerics study: quantize the FC1 input over 32 elements and replicate
+        # that scale into both block16 slots. The scale tensor keeps its
+        # block16 shape, so the GEMMs are untouched -- only which elements share
+        # a scale changes. 0 means "same as scaling_vector_size", the normal
+        # block16 path. The FC2 input is widened separately, in the kernels.
+        self.nvfp4_act_quant_vec_size = 32 if os.environ.get(
+            "TRTLLM_NVFP4_ACT_BLOCK32", "0") == "1" else 0
 
         # Routed-expert LoRA is fused inside torch.ops.trtllm.fused_moe. This
         # flag records whether the layer was configured with MoE LoRA targets,
@@ -825,7 +834,7 @@ class CutlassFusedMoE(MoEImplBase):
                         x_row = x.shape[0]
                         x, x_sf = torch.ops.trtllm.fp4_quantize(
                             x, self.fc31_input_scale, self.scaling_vector_size,
-                            False, False)
+                            False, False, self.nvfp4_act_quant_vec_size)
                     # Reshape x_sf to 2D for post-quant communication
                     if x_sf is not None:
                         x_sf = x_sf.view((x_row, -1))
@@ -833,7 +842,7 @@ class CutlassFusedMoE(MoEImplBase):
                     if not isinstance(x, Fp4QuantizedTensor):
                         x, x_sf = torch.ops.trtllm.fp4_quantize(
                             x, self.fc31_input_scale, self.scaling_vector_size,
-                            False, True)
+                            False, True, self.nvfp4_act_quant_vec_size)
             elif self.has_w4a8_mxfp4_mxfp8 or self.has_mxfp8:
                 # MXFP8 dynamic activation quantize. The MXFP8xMXFP8 path reuses
                 # the same activation quant kernel as W4A8 MXFP4xMXFP8 -- only
