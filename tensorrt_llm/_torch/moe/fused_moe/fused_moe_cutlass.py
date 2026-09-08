@@ -824,6 +824,18 @@ class CutlassFusedMoE(MoEImplBase):
                                                dyn_input_scale)
                     self.fc31_input_scale.data.copy_(dyn_input_scale)
 
+                # Fp4QuantizedTensor records no quantization block size, so a
+                # tensor from an upstream producer (a fused RMSNorm+quant, say)
+                # cannot be told apart from one this layer would have widened.
+                # Accepting it would leave FC1 at block16 while FC2 runs at
+                # block32 and report the result as block32, so refuse instead.
+                if self.nvfp4_act_quant_vec_size and isinstance(
+                        x, Fp4QuantizedTensor):
+                    raise RuntimeError(
+                        "TRTLLM_NVFP4_ACT_BLOCK32 got a pre-quantized FC1 input "
+                        "whose block size is unknown; the widened path needs the "
+                        "unquantized activation")
+
                 # Quantize based on communication scenario
                 if post_quant_comm:
                     if isinstance(x, Fp4QuantizedTensor):

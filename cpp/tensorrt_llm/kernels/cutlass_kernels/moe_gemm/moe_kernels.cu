@@ -1049,7 +1049,10 @@ __device__ auto quantizePackedFPXValue(ComputeElem& post_act_val, float global_s
             // branch is already opt-in through TRTLLM_NVFP4_ACT_BLOCK32, and
             // the flag keeps this to one line per process rather than per
             // launch, so it costs nothing when the study is not running.
-            if (atomicCAS(&gNvfp4Block32Traced, 0, 1) == 0)
+            // Read before the atomic: every thread reaches this for every 8
+            // elements, and an unconditional atomicCAS would serialise them all
+            // on one address for the whole run, not just the first time.
+            if (gNvfp4Block32Traced == 0 && atomicCAS(&gNvfp4Block32Traced, 0, 1) == 0)
             {
                 printf("[nvfp4-block32] branch taken: num_cols=%ld VecSize=%d\n", (long) num_cols, VecSize);
             }
