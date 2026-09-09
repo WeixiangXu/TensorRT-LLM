@@ -46,11 +46,15 @@ def main():
     ap.add_argument("--tp", type=int, default=8)
     ap.add_argument("--repeats", type=int, default=3)
     ap.add_argument("--out", default=None)
+    # Kimi K3 ships its own modeling code in the checkpoint; transformers
+    # refuses to load it without this.
+    ap.add_argument("--trust_remote_code", action="store_true")
     args = ap.parse_args()
 
     flag = os.environ.get("TRTLLM_NVFP4_ACT_BLOCK32", "0")
     llm = LLM(
         model=args.model_dir,
+        trust_remote_code=args.trust_remote_code,
         tensor_parallel_size=args.tp,
         moe_expert_parallel_size=args.tp,
         moe_config=MoeConfig(backend="CUTLASS"),
